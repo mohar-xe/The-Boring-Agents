@@ -1,236 +1,332 @@
 # The Boring Agents
 
-AI-powered content generation API for The Boring Education platform.
+AI-powered content generation API for [The Boring Education](https://www.theboringeducation.com) platform.
 
 ## Overview
 
-The Boring Agents is a FastAPI-based service that provides AI-powered content generation capabilities through REST APIs. All operations are called from the Admin UI and logged comprehensively for monitoring and debugging.
+The Boring Agents is a FastAPI service that generates educational content with LLMs. It exposes four
+content agents behind a common REST API:
+
+| Agent | Prefix | What it generates |
+|---|---|---|
+| **Quiz** | `/api/v1/quiz` | Multiple-choice quizzes with explanations, per topic |
+| **Interview** | `/api/v1/interview` | Interview question sheets and per-question answer generation |
+| **DSA** | `/api/v1/dsa` | DSA question sets plus a structured study guide, per topic |
+| **Aptitude** | `/api/v1/aptitude` | Aptitude question batches with answers and markdown study guides |
+
+Generation is **asynchronous**. A create endpoint returns a `session_id` immediately and the
+workflow runs in a FastAPI background task; you poll the session endpoint for progress and then
+fetch the output. Sessions are resumable and retryable, so a failed run can continue from where it
+stopped rather than starting over.
+
+Everything is driven from the Admin UI over HTTP. There is no CLI.
+
+## Architecture
+
+```
+POST /api/v1/dsa/topics
+  → routes/dsa.py            request/response validation
+  → controllers/dsa_controller.py   creates session, schedules BackgroundTasks
+  → agents/dsa/workflow.py   LangGraph: generate_questions → generate_study_guide → finalize
+  → agents/dsa/generators.py BaseAgent: format prompt → call LLM → parse JSON → normalize
+  → core/llm/                provider (OpenAI or Gemini) via LangChain
+  → core/session/            session state persisted to temp/dsa_sessions/<id>.json
+                             final artifact written to output/dsa/dsa_<slug>.json
+```
+
+Every agent follows the same four-layer shape, which is why adding an agent means copying one
+package rather than wiring new plumbing:
+
+- **`workflow.py`** — LangGraph `StateGraph` of nodes, plus an orchestrator subclass. Resume rules
+  live in `state_from_session()` and `determine_resume_status()`.
+- **`generators.py`** — a `BaseAgent` subclass holding prompt templates and response parsing.
+- **`validators.py`** — normalizes raw LLM output into the stable API schema.
+- **`session.py`** — the agent's session manager, extending `BaseSessionManager`.
+
+Shared infrastructure sits in `src/core/`:
+
+| Module | Responsibility |
+|---|---|
+| `core/llm/` | `LLMProvider` abstraction, `PROVIDER_REGISTRY`, OpenAI and Gemini implementations |
+| `core/orchestrator.py` | `BaseWorkflowOrchestrator` — session → state → `graph.invoke` → sync back |
+| `core/session/` | `BaseSessionManager`, file-backed session store, progress and chunk tracking |
+| `core/pipeline/` | `Job`, `ContentPipeline`, `ChunkedPipeline` (resumable generation), publish/push |
+| `core/env.py`, `core/config.py` | Environment loading, validation, defaults |
+
+### Repository layout
+
+```
+The-Boring-Agents/
+├── src/
+│   ├── agents/                 # one package per content agent
+│   │   ├── base.py             # BaseAgent: prompts, LLM handle, truncation guard
+│   │   ├── aptitude/           # questions, constants, study guide, workflow
+│   │   ├── dsa/                # questions, study guide, schema, validators, workflow
+│   │   ├── interview/          # sheets, questions, answers, utils, workflow
+│   │   └── quiz/               # quizzes, question metadata, workflow
+│   ├── api/
+│   │   ├── app.py              # FastAPI app factory, router registration, /health + /ping
+│   │   ├── routes/             # quiz, interview_prep, dsa, aptitude, session
+│   │   ├── controllers/        # business logic, background task scheduling
+│   │   ├── models/             # Pydantic request/response models
+│   │   ├── middleware.py       # request/response logging, X-Request-ID
+│   │   └── logging_config.py   # JSON log formatter, rotating file handler
+│   ├── core/                   # llm, orchestrator, session, pipeline, env, config
+│   └── utils/                  # helpers, validation, session/request logging
+├── tests/                      # pytest suite (api, unit, per-agent unit + integration)
+├── docs/LANGGRAPH_QUIZ_LEARNING.md
+├── output/                     # generated artifacts (gitignored)
+├── temp/                       # session state (gitignored)
+├── logs/                       # api.log, rotated (gitignored)
+├── run.py                      # uvicorn entry point
+├── pyproject.toml
+├── Dockerfile
+└── docker-compose.yml
+```
 
 ## Quick Start
 
 ### Prerequisites
 
-1. **Python 3.9+** installed (recommended to use a virtualenv)
-2. **API Keys** configured in `.env` file:
-   ```bash
-   OPENAI_API_KEY=your_openai_key
-   ANTHROPIC_API_KEY=your_anthropic_key
-   HUGGINGFACE_API_KEY=your_huggingface_key
-   ```
+- Python 3.9 or newer
+- At least one supported provider key: `OPENAI_API_KEY` or `GEMINI_API_KEY`
 
 ### Installation
 
-1. **Clone and setup**:
-
-   ```bash
-   git clone <repository-url>
-   cd The-Boring-Agents
-
-   # Create & activate virtualenv (macOS/Linux)
-   python3 -m venv .venv
-   source .venv/bin/activate
-
-   # Install the package in editable mode (recommended)
-   pip install -e .
-   ```
-
-   > **Note:** The project uses `pyproject.toml` for package management. Installing with `-e .` installs all dependencies and makes the `src` package available for absolute imports.
-
-2. **Configure environment**:
-
-   Create a `.env` file in the repo root (at least one provider key is required):
-
-   ```bash
-   cat > .env <<'EOF'
-   # AI Provider Keys (provide at least one)
-   OPENAI_API_KEY=your_openai_key
-   ANTHROPIC_API_KEY=your_anthropic_key
-   HUGGINGFACE_API_KEY=your_huggingface_key
-
-   # App behavior
-   ENVIRONMENT=dev
-   DEFAULT_MODEL=gpt-4o-mini
-   MAX_TOKENS=4000
-   TEMPERATURE=0.8
-   OUTPUT_DIR=./output
-   TEMP_DIR=./temp
-   LOG_DIR=./logs
-
-   # Local Agents API server controls
-   AGENTS_API_HOST=0.0.0.0
-   AGENTS_API_PORT=8000
-   RELOAD=1
-
-   # Backend URLs used for uploads (optional)
-   LOCAL_API_BASE_URL=http://localhost:3000
-   DEV_API_BASE_URL=https://tbe-dev-git-development-tbe.vercel.app
-   PROD_API_BASE_URL=https://www.theboringeducation.com
-   EOF
-   ```
-
-### Start the Agents API (FastAPI)
-
 ```bash
-# From repo root
+git clone https://github.com/The-Boring-Education/The-Boring-Agents.git
+cd The-Boring-Agents
+
+python3 -m venv .venv
 source .venv/bin/activate
-export OPENAI_API_KEY=...  # set at least one provider key, or use .env
 
-# Optional: override host/port
-export AGENTS_API_HOST=0.0.0.0
-export AGENTS_API_PORT=8000
-
-python run.py  # FastAPI on http://localhost:8000
-# Swagger UI: http://localhost:8000/docs
+pip install -e .            # add dev extras for the test suite
+pip install -e ".[dev]"
 ```
 
-### Start the Agents API with Docker
+### Configure environment
+
+Create a `.env` file in the repo root. At least one provider key is required.
 
 ```bash
-# Build and start the container
+cat > .env <<'EOF'
+# LLM providers (at least one)
+OPENAI_API_KEY=your_openai_key
+GEMINI_API_KEY=your_gemini_key
+
+# Behavior
+ENVIRONMENT=dev                # local | dev | prod
+LOG_LEVEL=INFO
+OUTPUT_DIR=./output
+TEMP_DIR=./temp
+LOG_DIR=./logs
+
+# Generation
+DEFAULT_MODEL=gpt-4o-mini
+TEMPERATURE=0.8
+MAX_TOKENS=4000
+MAX_CONTEXT_LENGTH=16000
+
+# Server
+AGENTS_API_HOST=0.0.0.0
+AGENTS_API_PORT=8000
+RELOAD=1
+
+# Upload targets (used by the /upload and /push endpoints)
+LOCAL_API_BASE_URL=http://localhost:3000
+DEV_API_BASE_URL=https://tbe-dev-git-development-tbe.vercel.app
+PROD_API_BASE_URL=https://www.theboringeducation.com
+
+# Shared secret sent as the x-admin-secret header on upload/push
+ADMIN_SECRET=TBEAdmin
+EOF
+```
+
+Files are loaded in this order, later wins: `.env.local` → `.env` → process environment.
+
+> **Note** — `DEFAULT_MODEL` must name a model the configured provider actually serves. With
+> `GEMINI_API_KEY`, set it to a Gemini model id (for example `gemini-2.0-flash`); the shipped
+> default, `gpt-4o-mini`, is an OpenAI model.
+
+### Run the server
+
+```bash
+python run.py                 # http://localhost:8000, auto-reload by default
+```
+
+- Swagger UI: `http://localhost:8000/docs`
+- ReDoc: `http://localhost:8000/redoc`
+- OpenAPI JSON: `http://localhost:8000/openapi.json`
+
+### Run with Docker
+
+```bash
 docker-compose up -d
-
-# View logs
 docker-compose logs -f
-
-# Stop the container
 docker-compose down
-
-# Rebuild after code changes
-docker-compose up -d --build
-
-# Access the API
-curl http://localhost:8000/health
-curl http://localhost:8000/api/v1/ping
 ```
 
-**Note**: Make sure to set your API keys in the `.env` file or in `docker-compose.yml` environment variables before starting the container.
+The compose file mounts `./output`, `./temp` and `./logs`, so generated content survives container
+restarts.
 
-## File Structure
+## Configuration
 
-```
-The-Boring-Agents/
-├── lab/
-│   └── interview-prep/          # Interview preparation files
-│       ├── dsa_requirements.mdx     # Requirements for DSA interviews
-│       ├── dsa_questions.mdx        # DSA questions list
-│       ├── dsa_questions_with_metadata.mdx  # Questions with metadata
-│       └── test_questions.mdx       # Test file for quick testing
-├── src/
-│   ├── agents/                 # AI agents for different tasks
-│   │   ├── interview/          # Interview preparation agents
-│   │   ├── project/           # Project generation agents
-│   │   ├── quiz/              # Quiz generation agents
-│   │   └── shiksha/           # Course creation agents
-│   ├── api/                   # API routes and middleware
-│   │   ├── app.py             # FastAPI application setup
-│   │   ├── middleware.py      # Request/response logging middleware
-│   │   ├── logging_config.py  # Centralized logging configuration
-│   │   ├── controllers/       # Business logic controllers
-│   │   ├── models/            # Pydantic request/response models
-│   │   └── routes/            # API route definitions
-│   │       ├── quiz.py        # Quiz generation endpoints
-│   │       ├── interview_prep.py  # Interview preparation endpoints
-│   │       └── session.py     # Session management endpoints
-│   ├── core/                  # Core functionality
-│   │   ├── env.py             # Environment variable management
-│   │   └── config.py           # Configuration management
-│   └── utils/                 # Utility functions
-├── output/                    # Generated content output
-├── logs/                      # API logs (rotated)
-├── run.py                     # API server entry point
-├── Dockerfile                 # Docker configuration
-├── docker-compose.yml         # Docker Compose configuration
-└── requirements.txt           # Python dependencies
-```
+All environment variables, their defaults and precedence rules are documented in
+[`src/core/README.md`](src/core/README.md). Summary:
 
-## API Documentation
+| Variable | Default | Purpose |
+|---|---|---|
+| `OPENAI_API_KEY` | — | OpenAI provider key |
+| `GEMINI_API_KEY` | — | Gemini provider key |
+| `DEFAULT_MODEL` | `gpt-4o-mini` | Model id passed to the provider |
+| `TEMPERATURE` | `0.8` | Sampling temperature |
+| `MAX_TOKENS` | `4000` | Max output tokens per call |
+| `MAX_CONTEXT_LENGTH` | `16000` | Prompt budget; longer prompts are truncated with a warning |
+| `ENVIRONMENT` | `dev` | `local`, `dev` or `prod`; selects the upload base URL |
+| `OUTPUT_DIR` | `./output` | Final artifact directory |
+| `TEMP_DIR` | `./temp` | Session state directory |
+| `LOG_DIR` | `./logs` | Log file directory |
+| `LOG_LEVEL` | `INFO` | Log level |
+| `AGENTS_API_HOST` | `0.0.0.0` | Bind address |
+| `AGENTS_API_PORT` | `8000` | Bind port |
+| `RELOAD` | `1` | uvicorn auto-reload |
+| `ADMIN_SECRET` | `TBEAdmin` | Value of the `x-admin-secret` header on upload/push |
+| `LOCAL_API_BASE_URL` | `http://localhost:3000` | Upload target for `ENVIRONMENT=local` |
+| `DEV_API_BASE_URL` | TBE dev Vercel URL | Upload target for `ENVIRONMENT=dev` |
+| `PROD_API_BASE_URL` | `https://www.theboringeducation.com` | Upload target for `ENVIRONMENT=prod` |
 
-### Base URL
+## API
 
-- **Local**: `http://localhost:8000`
-- **Development**: Configure via `DEV_API_BASE_URL`
-- **Production**: Configure via `PROD_API_BASE_URL`
+Base URL: `http://localhost:8000` locally. Upload endpoints resolve their target from
+`ENVIRONMENT`.
 
-### API Endpoints
+### Health
 
-#### Health & Status
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/v1` | Service metadata and endpoint index |
+| `GET` | `/api/v1/health` | Health check |
+| `GET` | `/api/v1/ping` | Health check with version |
 
-- `GET /health` - Health check endpoint
-- `GET /api/v1/ping` - Service ping with version info
+### Quiz — `/api/v1/quiz`
 
-#### Quiz Generation
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/v1/quiz/quizzes` | Create a quiz session |
+| `GET` | `/api/v1/quiz/topics` | List supported quiz topics |
+| `POST` | `/api/v1/quiz/topics` | Generate a quiz for one topic |
+| `POST` | `/api/v1/quiz/generate` | Generate a quiz |
+| `GET` | `/api/v1/quiz/pending` | List artifacts awaiting upload |
+| `GET` | `/api/v1/quiz/pending/{filename}/content` | Read a pending artifact |
+| `DELETE` | `/api/v1/quiz/pending/{filename}` | Delete a pending artifact |
+| `GET` | `/api/v1/quiz/sessions` | List quiz sessions |
+| `GET` | `/api/v1/quiz/sessions/{session_id}` | Session status and progress |
+| `GET` | `/api/v1/quiz/sessions/{session_id}/output` | Generated quiz |
+| `GET` | `/api/v1/quiz/progress/{session_id}` | Progress only |
+| `POST` | `/api/v1/quiz/sessions/{session_id}/cancel` | Cancel a session |
+| `POST` | `/api/v1/quiz/sessions/{session_id}/resume` | Resume a paused session |
+| `POST` | `/api/v1/quiz/sessions/{session_id}/retry` | Retry a failed session |
+| `DELETE` | `/api/v1/quiz/sessions/{session_id}` | Delete a session and its artifact |
+| `POST` | `/api/v1/quiz/validate` | Validate a quiz against the DB schema |
+| `POST` | `/api/v1/quiz/upload` | Upload a generated quiz |
 
-- `GET /api/v1/quiz/topics` - Get available quiz topics
-- `POST /api/v1/quiz/generate` - Generate a complete quiz
-- `POST /api/v1/quiz/validate` - Validate quiz structure
-- `POST /api/v1/quiz/upload` - Upload quiz to database
-- `GET /api/v1/quiz/sessions` - List active quiz sessions
-- `GET /api/v1/quiz/progress/{session_id}` - Get quiz generation progress
-- `GET /api/v1/quiz/logs/{session_id}` - Get quiz session logs
-- `GET /api/v1/quiz/pending` - List pending quiz files
-- `GET /api/v1/quiz/pending/{filename}/content` - Get pending quiz content
-- `DELETE /api/v1/quiz/pending/{filename}` - Delete pending quiz file
+`/api/v1/quiz/session/{session_id}` (singular) exists as a legacy alias of the plural routes.
 
-#### Interview Preparation
+### Interview — `/api/v1/interview`
 
-- `POST /api/v1/interview/sheets` - Create interview sheet with name and description
-- `POST /api/v1/interview/topics` - Generate questions for a single topic
-- `GET /api/v1/interview/sessions` - List interview sessions
-- `GET /api/v1/interview/sessions/{session_id}` - Get session progress
-- `GET /api/v1/interview/sessions/{session_id}/output` - Get session output
-- `POST /api/v1/interview/sessions/{session_id}/cancel` - Cancel a session
-- `POST /api/v1/interview/sessions/{session_id}/resume` - Resume a paused session
-- `POST /api/v1/interview/sessions/{session_id}/retry` - Retry a failed session
-- `DELETE /api/v1/interview/sessions/{session_id}` - Delete a session
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/v1/interview/sheets` | Create an interview sheet |
+| `POST` | `/api/v1/interview/topics` | Generate questions for one topic |
+| `POST` | `/api/v1/interview/generate-topic` | Generate questions for one topic (alias) |
+| `GET` | `/api/v1/interview/topic-templates` | List topic templates |
+| `GET` | `/api/v1/interview/roadmap-suggestions` | List roadmap suggestions |
+| `GET` | `/api/v1/interview/sessions` | List sessions |
+| `GET` | `/api/v1/interview/sessions/{session_id}` | Session status |
+| `GET` | `/api/v1/interview/sessions/{session_id}/output` | Generated sheet |
+| `PUT` | `/api/v1/interview/sessions/{session_id}/sheet` | Update sheet metadata |
+| `GET` | `/api/v1/interview/sessions/{session_id}/questions/{question_id}` | Read one question |
+| `PUT` | `/api/v1/interview/sessions/{session_id}/questions/{question_id}` | Update one question |
+| `DELETE` | `/api/v1/interview/sessions/{session_id}/questions/{question_id}` | Delete one question |
+| `POST` | `/api/v1/interview/sessions/{session_id}/questions` | Add a question |
+| `POST` | `/api/v1/interview/sessions/{session_id}/cancel` | Cancel a session |
+| `POST` | `/api/v1/interview/sessions/{session_id}/resume` | Resume a session |
+| `POST` | `/api/v1/interview/sessions/{session_id}/retry` | Retry a session |
+| `DELETE` | `/api/v1/interview/sessions/{session_id}` | Delete a session |
+| `POST` | `/api/v1/interview/validate` | Validate generated content |
+| `POST` | `/api/v1/interview/upload` | Upload generated content |
 
-#### Session Management
+The singular `/api/v1/interview/session/{session_id}` family is a legacy alias kept for
+backwards compatibility.
 
-- `GET /api/v1/sessions/active` - List all active sessions (quiz + interview)
-- `GET /api/v1/sessions/logs/{session_id}` - Get session logs
-- `GET /api/v1/sessions/detail/{session_id}` - Get session detail
-- `POST /api/v1/sessions/resume/{session_id}` - Resume a paused session
-- `DELETE /api/v1/sessions/{session_id}` - Delete a session and its artifacts
+### DSA — `/api/v1/dsa`
 
-### API Examples
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/v1/dsa/topics` | Generate questions and study guide for a topic |
+| `POST` | `/api/v1/dsa/generate-topic` | Same, under the legacy path |
+| `GET` | `/api/v1/dsa/sessions` | List sessions |
+| `GET` | `/api/v1/dsa/sessions/{session_id}` | Session status |
+| `GET` | `/api/v1/dsa/sessions/{session_id}/output` | Questions plus study guide |
+| `PUT` | `/api/v1/dsa/sessions/{session_id}/questions/{question_index}` | Update one question |
+| `POST` | `/api/v1/dsa/sessions/{session_id}/push` | Publish generated content to TBE-Web |
+| `POST` | `/api/v1/dsa/sessions/{session_id}/cancel` | Cancel a session |
+| `POST` | `/api/v1/dsa/sessions/{session_id}/resume` | Resume a session |
+| `POST` | `/api/v1/dsa/sessions/{session_id}/retry` | Retry a session |
+| `DELETE` | `/api/v1/dsa/sessions/{session_id}` | Delete a session |
 
-#### Generate a Quiz
+### Aptitude — `/api/v1/aptitude`
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/v1/aptitude/generate` | Generate questions and answers for a topic |
+| `POST` | `/api/v1/aptitude/generate-batch` | Generate across several topics |
+| `GET` | `/api/v1/aptitude/topics` | List supported topics |
+| `POST` | `/api/v1/aptitude/generate-study-guide` | Generate a markdown study guide |
+| `POST` | `/api/v1/aptitude/upload-study-guide` | Upload a study guide |
+| `POST` | `/api/v1/aptitude/upload` | Upload generated questions |
+
+### Sessions — `/api/v1/sessions`
+
+Agent-agnostic session endpoints.
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/v1/sessions/active` | List active sessions across all agents |
+| `GET` | `/api/v1/sessions/logs/{session_id}` | Recent JSONL logs for a session |
+| `GET` | `/api/v1/sessions/detail/{session_id}` | Full session detail |
+| `POST` | `/api/v1/sessions/resume/{session_id}` | Resume any session |
+| `DELETE` | `/api/v1/sessions/{session_id}` | Delete a session and its artifacts |
+
+### Examples
+
+Generate a DSA package:
 
 ```bash
-curl -X POST http://localhost:8000/api/v1/quiz/generate \
+curl -X POST http://localhost:8000/api/v1/dsa/topics \
   -H 'Content-Type: application/json' \
-  -d '{
-    "topic": "React",
-    "question_count": 20,
-    "target_audience": "developers",
-    "save": true,
-    "environment": "local"
-  }'
+  -d '{"topic": "Sliding Window", "questionCount": 20, "difficulty": "MEDIUM"}'
 ```
 
-#### Generate Interview Questions
+```json
+{"sessionId": "0f2c...","message": "DSA generation started"}
+```
+
+Poll it, then read the result:
 
 ```bash
-curl -X POST http://localhost:8000/api/v1/interview/topics \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "topic": "Python",
-    "agentType": "tech",
-    "technology": "Python",
-    "questionCount": 25,
-    "roadmap": "Backend",
-    "difficulty": "Medium",
-    "generateAnswers": true
-  }'
+curl http://localhost:8000/api/v1/dsa/sessions/$SESSION_ID
+curl http://localhost:8000/api/v1/dsa/sessions/$SESSION_ID/output
 ```
 
-#### Create Interview Sheet
+Generate an interview sheet:
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/interview/sheets \
   -H 'Content-Type: application/json' \
   -d '{
     "name": "React.js Interview",
-    "description": "Comprehensive React.js interview preparation",
+    "description": "Comprehensive React.js preparation",
     "agentType": "tech",
     "technology": "React",
     "questionCount": 30,
@@ -238,30 +334,24 @@ curl -X POST http://localhost:8000/api/v1/interview/sheets \
   }'
 ```
 
-#### Check Session Progress
+### Session lifecycle
 
-```bash
-curl http://localhost:8000/api/v1/quiz/progress/{session_id}
-```
+`pending` → `in_progress` → `completed`, with `failed` and `cancelled` as terminal alternatives.
 
-#### Get Session Logs
-
-```bash
-curl http://localhost:8000/api/v1/sessions/logs/{session_id}?limit=100
-```
+- **Resume** picks up where the previous run stopped: nodes whose output is already populated are
+  skipped.
+- **Retry** restarts a failed run from its persisted session state.
+- Because state is persisted to `TEMP_DIR`, re-running a session id will not regenerate content
+  that already exists. Delete the session, or point `TEMP_DIR` at a fresh directory, to force
+  regeneration.
 
 ## Logging
 
-The API provides comprehensive structured logging for all operations. All logs are written in JSON format for easy parsing and analysis.
+Structured JSON logging to console and to a rotating file.
 
-### Log Locations
-
-- **Console**: Structured JSON logs to stdout/stderr
-- **File**: `logs/api.log` (rotated, 10MB per file, 5 backups)
-
-### Log Format
-
-All logs follow a structured JSON format:
+- **Console**: JSON to stdout
+- **File**: `logs/api.log`, rotated at 10 MB with 5 backups
+- **Levels**: `DEBUG`, `INFO`, `WARNING`, `ERROR`
 
 ```json
 {
@@ -276,231 +366,101 @@ All logs follow a structured JSON format:
 }
 ```
 
-### Log Levels
-
-- **INFO**: Normal operations, request/response logging
-- **WARNING**: Non-critical issues, validation failures
-- **ERROR**: Errors, exceptions, failed operations
-- **DEBUG**: Detailed debugging information (when enabled)
-
-### Request Tracking
-
-Every API request receives a unique `request_id` that is:
-
-- Included in all logs related to that request
-- Returned in response headers as `X-Request-ID`
-- Used for tracing requests through the system
-
-### Logging Features
-
-- **Request/Response Logging**: All API requests and responses are logged with timing
-- **Structured Format**: JSON format for easy parsing and analysis
-- **Sensitive Data Masking**: API keys and secrets are automatically masked
-- **Environment Context**: All logs include environment information
-- **Session Tracking**: Session IDs are included in relevant logs
-- **Error Tracking**: Full error details with stack traces for debugging
-
-### Viewing Logs
+Every request gets a `request_id` that appears in its logs and is returned in the `X-Request-ID`
+response header. API keys and admin secrets are masked before logging.
 
 ```bash
-# View live logs
 tail -f logs/api.log
-
-# View logs in JSON format
-cat logs/api.log | jq
-
-# Filter by request ID
-cat logs/api.log | jq 'select(.request_id == "your-request-id")'
-
-# Filter by action
-cat logs/api.log | jq 'select(.action == "generate_quiz")'
-
-# Filter errors
-cat logs/api.log | jq 'select(.level == "ERROR")'
+jq 'select(.level == "ERROR")' logs/api.log
+jq 'select(.request_id == "request-id-from-header")' logs/api.log
 ```
 
-## Environment Variables
-
-See `src/core/README.md` for detailed environment variable documentation.
-
-### Key Variables
-
-- `OPENAI_API_KEY` - OpenAI API key (at least one API key required)
-- `ANTHROPIC_API_KEY` - Anthropic API key
-- `HUGGINGFACE_API_KEY` - HuggingFace API key
-- `ENVIRONMENT` - Environment: `local`, `dev`, or `prod`
-- `LOG_LEVEL` - Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR`
-- `AGENTS_API_HOST` - API server host (default: `0.0.0.0`)
-- `AGENTS_API_PORT` - API server port (default: `8000`)
-- `RELOAD` - Enable auto-reload for development (default: `1`)
-
-## Configuration
-
-### Environment Management
-
-The system uses a centralized environment management module (`src/core/env.py`) that provides:
-
-- Centralized environment variable loading
-- Type-safe getters (str, int, bool, float)
-- Comprehensive logging of environment loading
-- Validation of required variables
-- Sensitive data masking in logs
-
-### Logging Configuration
-
-Logging is configured in `src/api/logging_config.py` and provides:
-
-- Structured JSON logging
-- File rotation (10MB per file, 5 backups)
-- Environment-based log levels
-- Console and file handlers
+Session-scoped logs are also available over HTTP at
+`GET /api/v1/sessions/logs/{session_id}?limit=100`.
 
 ## Development
 
-### Running the Server
-
 ```bash
-# Development mode (with auto-reload)
-export RELOAD=1
-python3 run.py
+export RELOAD=1     # auto-reload
+python run.py
 
-# Production mode
-export RELOAD=0
-python3 run.py
+export RELOAD=0     # no reload
+python run.py
 ```
 
-### API Documentation
-
-- **Swagger UI**: `http://localhost:8000/docs`
-- **ReDoc**: `http://localhost:8000/redoc`
-- **OpenAPI JSON**: `http://localhost:8000/openapi.json`
-
-### Testing API Endpoints
+### Tests
 
 ```bash
-# Health check
-curl http://localhost:8000/health
-
-# Ping
-curl http://localhost:8000/api/v1/ping
-
-# Get available quiz topics
-curl http://localhost:8000/api/v1/quiz/topics
-
-# List active sessions
-curl http://localhost:8000/api/v1/sessions/active
+pip install -e ".[dev]"
+pytest                              # whole suite
+pytest tests/unit                   # core and utils
+pytest tests/api                    # API layer
+pytest tests/aptitude tests/quiz    # per-agent
 ```
 
-## Docker Deployment
+See [`tests/README.md`](tests/README.md) for suite layout and conventions. `tests/conftest.py`
+provides the shared fixtures: an in-process `TestClient`, temp directories that isolate
+`TEMP_DIR`/`OUTPUT_DIR`, and mocked LLM providers so tests never make network calls.
 
-### Build and Run
+### Adding an agent
+
+1. Create `src/agents/<name>/` with `prompts.py`, `generators.py`, `validators.py`, `session.py`
+   and `workflow.py`.
+2. Subclass `BaseWorkflowOrchestrator`; implement `state_from_session()` and
+   `determine_resume_status()` for resume support.
+3. Register a router in `src/api/routes/` and include it in `src/api/app.py`.
+
+## Docker
 
 ```bash
-# Build image
 docker build -t the-boring-agents .
 
-# Run container
 docker run -d \
   -p 8000:8000 \
   -v $(pwd)/output:/app/output \
+  -v $(pwd)/temp:/app/temp \
   -v $(pwd)/logs:/app/logs \
   -e OPENAI_API_KEY=your_key \
   the-boring-agents
-
-# Or use docker-compose
-docker-compose up -d
 ```
 
-### Environment Variables in Docker
-
-Set environment variables in `docker-compose.yml` or use a `.env` file:
+Or use compose, which reads `./.env`:
 
 ```yaml
 environment:
   - OPENAI_API_KEY=${OPENAI_API_KEY}
-  - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+  - GEMINI_API_KEY=${GEMINI_API_KEY}
   - ENVIRONMENT=prod
   - LOG_LEVEL=INFO
 ```
 
-## Monitoring
-
-### Health Checks
-
-The API provides health check endpoints for monitoring:
-
-```bash
-# Basic health check
-curl http://localhost:8000/health
-
-# Service ping with version
-curl http://localhost:8000/api/v1/ping
-```
-
-### Log Monitoring
-
-Monitor logs for:
-
-- Request/response patterns
-- Error rates
-- Performance metrics (duration_ms)
-- Session tracking
-- Environment-specific issues
-
-### Request ID Tracking
-
-Use the `X-Request-ID` header to track requests:
-
-```bash
-# Make request and capture request ID
-curl -i -X POST http://localhost:8000/api/v1/quiz/generate \
-  -H 'Content-Type: application/json' \
-  -d '{"topic": "React", "question_count": 10}'
-
-# Filter logs by request ID
-cat logs/api.log | jq 'select(.request_id == "request-id-from-header")'
-```
-
 ## Troubleshooting
 
-### API Not Starting
+**Server will not start**
+1. Confirm at least one of `OPENAI_API_KEY` / `GEMINI_API_KEY` is set
+2. Confirm `AGENTS_API_PORT` (8000) is free
+3. Check `logs/api.log`
 
-1. Check environment variables are set
-2. Verify API keys are configured
-3. Check port 8000 is available
-4. Review logs for errors
+**No log file**
+1. Check `LOG_DIR` and write permissions
+2. Confirm `LOG_LEVEL` is set
 
-### No Logs Appearing
+**Provider errors**
+1. Confirm the key is valid and not expired
+2. Confirm `DEFAULT_MODEL` is a model your provider serves — an OpenAI model id with
+   `GEMINI_API_KEY` set will fail
+3. Check the request duration against `MAX_TOKENS` and `MAX_CONTEXT_LENGTH`
 
-1. Check `LOG_DIR` environment variable
-2. Verify write permissions for log directory
-3. Check `LOG_LEVEL` is set appropriately
-4. Review console output for errors
+**Session stuck in `in_progress`**
+Sessions run as FastAPI background tasks in-process. A worker restart leaves them incomplete —
+resume or retry the session. Generation is slow for large `questionCount` values.
 
-### API Keys Not Working
+## Contributing
 
-1. Verify keys are set in `.env` file
-2. Check keys are not expired
-3. Review logs for API key validation errors
-4. Ensure at least one API key is configured
+Issues and pull requests are welcome. Please keep changes scoped, and update `readme.md` when you
+change the API surface or configuration.
 
-## Architecture
+## License
 
-The system is built as a pure API service:
-
-- **FastAPI** for the web framework
-- **Structured JSON logging** for all operations
-- **Request ID tracking** for traceability
-- **Environment-aware** configuration
-- **Docker-ready** for deployment
-
-All operations are called via REST APIs from the Admin UI. No CLI interface is available.
-
-## Support
-
-For issues or questions:
-
-1. Check the API health: `curl http://localhost:8000/health`
-2. Review logs: `tail -f logs/api.log`
-3. Check environment configuration: Review `.env` file
-4. Verify API keys are configured correctly
+MIT, as declared in `pyproject.toml`. Note that no `LICENSE` file is present in the repository yet
+— adding one would be a welcome contribution.
